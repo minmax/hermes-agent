@@ -419,8 +419,11 @@ class TelegramAdapter(BasePlatformAdapter):
         self._mention_patterns = self._compile_mention_patterns()
         self._reply_to_mode: str = getattr(config, 'reply_to_mode', 'first') or 'first'
         self._disable_link_previews: bool = self._coerce_bool_extra("disable_link_previews", False)
-        # Bot API 10.1 Rich Messages: send final replies via sendRichMessage
-        # with the raw agent markdown so tables/task lists/etc. render natively.
+        # Bot API 10.1 Rich Messages: when explicitly enabled, send final
+        # replies via sendRichMessage with the raw agent markdown so
+        # tables/task lists/etc. render natively. Disabled by default because
+        # several Telegram clients accept but render rich messages poorly.
+        self._rich_messages_enabled: bool = self._coerce_bool_extra("rich_messages", False)
         # Latched off after a capability failure on sendRichMessage /
         # sendRichMessageDraft (e.g. older python-telegram-bot without the
         # endpoint) so later sends skip the doomed rich attempt entirely.
@@ -950,14 +953,42 @@ class TelegramAdapter(BasePlatformAdapter):
         """
         return inspect.iscoroutinefunction(getattr(self._bot, "do_api_request", None))
 
+    _RICH_DETAILS_RE = re.compile(r"<details\b[^>]*>.*?</details>", re.IGNORECASE | re.DOTALL)
+    _RICH_MATH_IN_DETAILS_RE = re.compile(
+        r"(\$\$.*?\$\$|"
+        r"\\\[.*?\\\]|"
+        r"\\\(.*?\\\)|"
+        r"\\(?:sum|frac|alpha|beta|gamma|delta|theta|lambda|mu|pi|sigma|"
+        r"int|prod|sqrt|lim|infty|begin\{(?:equation|align|matrix|cases)\}))",
+        re.IGNORECASE | re.DOTALL,
+    )
+
+    def _has_telegram_desktop_details_math_crash_shape(self, content: str) -> bool:
+        """Return True for rich-message details+math content that crashes TDesktop.
+
+        Telegram Desktop 6.9.1 can crash while rendering Bot API 10.1 rich
+        messages containing math inside a collapsible details block
+        (telegramdesktop/tdesktop#30808). The Bot API accepts the payload, so
+        Hermes must skip rich delivery up front and use the legacy MarkdownV2
+        path until affected Desktop clients age out.
+        """
+        if not content:
+            return False
+        for details_block in self._RICH_DETAILS_RE.findall(content):
+            if self._RICH_MATH_IN_DETAILS_RE.search(details_block):
+                return True
+        return False
+
     def _should_attempt_rich(
         self, content: str, metadata: Optional[Dict[str, Any]] = None
     ) -> bool:
         return bool(
-            not getattr(self, "_rich_send_disabled", False)
+            getattr(self, "_rich_messages_enabled", False)
+            and not getattr(self, "_rich_send_disabled", False)
             and not (metadata or {}).get("expect_edits")
             and content
             and content.strip()
+            and not self._has_telegram_desktop_details_math_crash_shape(content)
             and self._content_fits_rich_limits(content)
             and self._bot_supports_rich()
         )
@@ -965,23 +996,16 @@ class TelegramAdapter(BasePlatformAdapter):
     def prefers_fresh_final_streaming(
         self, content: str, metadata: Optional[Dict[str, Any]] = None
     ) -> bool:
-        """Finalize rich-eligible streamed replies with a fresh sendRichMessage
-        instead of Hermes' current MarkdownV2 edit path.
+        """Whether to replace a streamed preview with a fresh rich final.
 
-        The final edit path has not yet been upgraded to Bot API 10.1's
-        ``rich_message`` edit parameter, so finalizing through edit would lose
-        rich constructs such as tables/task lists.  When the completed content
-        is rich-eligible, re-send it via ``sendRichMessage`` and delete the
-        preview (see ``gateway.stream_consumer._try_fresh_final``).
-
-        ``metadata`` is intentionally ignored: the preview was sent with
-        ``expect_edits=True`` (to stay on the editable path mid-stream), but the
-        FINAL answer is a brand-new message that should render rich.  Gating
-        otherwise matches :meth:`_should_attempt_rich`: rich not latched off,
-        content present and within the rich character limit, and the bot exposes
-        an async ``do_api_request``.
+        Keep this disabled for Telegram. The fresh-final path briefly shows two
+        copies of the final answer, then deletes the streaming preview after the
+        rich send succeeds. That is especially visible on clients that support
+        rich messages well, and it looks like duplicate delivery at the end of
+        every streamed turn. Until Telegram rich edits are wired directly, final
+        streamed replies should edit the existing preview in place.
         """
-        return self._should_attempt_rich(content)
+        return False
 
     def streaming_overflow_limit(self) -> Optional[int]:
         """Allow the stream consumer to accumulate up to the rich-message cap
@@ -995,7 +1019,8 @@ class TelegramAdapter(BasePlatformAdapter):
         streams split exactly as before.
         """
         if (
-            not getattr(self, "_rich_send_disabled", False)
+            getattr(self, "_rich_messages_enabled", False)
+            and not getattr(self, "_rich_send_disabled", False)
             and self._bot_supports_rich()
         ):
             return self.RICH_MESSAGE_MAX_CHARS
@@ -1022,16 +1047,19 @@ class TelegramAdapter(BasePlatformAdapter):
         rejections (BadRequest from a parser/limit issue) are NOT capability
         errors: the next message may be fine.
         """
+        name = exc.__class__.__name__.lower()
+        if name in {"endpointnotfound", "invalidtoken"}:
+            return True
         if isinstance(exc, (AttributeError, TypeError, NotImplementedError)):
             return True
         if getattr(exc, "error_code", None) == 404:
             return True
         s = str(exc).lower()
-        if ("method" in s and "not found" in s) or "no such method" in s:
+        if ("method" in s or "endpoint" in s) and (
+            "not found" in s or "does not exist" in s
+        ):
             return True
-        if "unsupported" in s or "not implemented" in s:
-            return True
-        return False
+        return "no such method" in s
 
     def _is_rich_fallback_error(self, exc: Exception) -> bool:
         """True ⇒ permanent/capability error ⇒ safe to fall back to legacy.
@@ -1043,7 +1071,10 @@ class TelegramAdapter(BasePlatformAdapter):
         """
         if self._is_bad_request_error(exc):
             return True
-        return self._is_rich_capability_error(exc)
+        if self._is_rich_capability_error(exc):
+            return True
+        s = str(exc).lower()
+        return "unsupported" in s or "not implemented" in s
 
     def _compute_single_send_routing(
         self,
@@ -1116,6 +1147,8 @@ class TelegramAdapter(BasePlatformAdapter):
         # which must not be sent as a stray field on the raw endpoint.
         payload.update({k: v for k, v in thread_kwargs.items() if v is not None})
         payload.update(self._notification_kwargs(metadata))
+        if getattr(self, "_disable_link_previews", False):
+            payload["link_preview_options"] = {"is_disabled": True}
         if reply_to_id is not None:
             # Spec: sendRichMessage takes reply_parameters (ReplyParameters
             # object), NOT the legacy reply_to_message_id scalar. Unknown
@@ -1124,8 +1157,12 @@ class TelegramAdapter(BasePlatformAdapter):
             payload["reply_parameters"] = {"message_id": reply_to_id}
 
         try:
+            # Take the raw Bot API result (dict under real PTB). Passing
+            # return_type=Message would make PTB deserialize a Bot API 10.1
+            # response shape it does not fully model yet; a post-delivery parse
+            # error must not be mistaken for a sendable failure.
             msg = await self._bot.do_api_request(
-                "sendRichMessage", api_kwargs=payload, return_type=Message
+                "sendRichMessage", api_kwargs=payload
             )
         except Exception as exc:
             if self._is_rich_fallback_error(exc):
@@ -1162,7 +1199,7 @@ class TelegramAdapter(BasePlatformAdapter):
         if isinstance(msg, dict):
             message_id = msg.get("message_id")
             if message_id is None:
-                message_id = msg.get("result", {}).get("message_id")
+                message_id = (msg.get("result") or {}).get("message_id")
         else:
             message_id = getattr(msg, "message_id", None)
         return SendResult(
@@ -1172,10 +1209,12 @@ class TelegramAdapter(BasePlatformAdapter):
 
     def _should_attempt_rich_draft(self, content: str) -> bool:
         return bool(
-            not getattr(self, "_rich_send_disabled", False)
+            getattr(self, "_rich_messages_enabled", False)
+            and not getattr(self, "_rich_send_disabled", False)
             and not getattr(self, "_rich_draft_disabled", False)
             and content
             and content.strip()
+            and not self._has_telegram_desktop_details_math_crash_shape(content)
             and self._content_fits_rich_limits(content)
             and self._bot_supports_rich()
         )
@@ -5514,6 +5553,52 @@ class TelegramAdapter(BasePlatformAdapter):
         event.text = self._append_observed_note(event.text, cached.context_note())
         logger.info("[Telegram] Cached observed group %s at %s", cached.kind, cached.path)
 
+    async def _cache_replied_media(self, msg: Any, event: MessageEvent) -> None:
+        """Cache media from the message this turn replies to, if any."""
+        from gateway.platforms.base import cache_media_bytes
+
+        reply_msg = getattr(msg, "reply_to_message", None)
+        if reply_msg is None:
+            return
+        source, filename, mime, kind = self._observed_media_source(reply_msg)
+        if source is None:
+            return
+
+        max_bytes = getattr(self, "_max_doc_bytes", 20 * 1024 * 1024)
+        file_size = getattr(source, "file_size", None)
+        try:
+            size = int(file_size or 0)
+        except (TypeError, ValueError):
+            size = 0
+        if not (0 < size <= max_bytes):
+            return
+
+        try:
+            file_obj = await source.get_file()
+            data = bytes(await file_obj.download_as_bytearray())
+            if not filename:
+                filename = os.path.basename(getattr(file_obj, "file_path", "") or "")
+            cached = cache_media_bytes(data, filename=filename, mime_type=mime, default_kind=kind)
+        except Exception as exc:
+            logger.warning("[Telegram] Failed to cache replied-to media: %s", exc, exc_info=True)
+            return
+
+        if cached is None:
+            return
+
+        event.media_urls.append(cached.path)
+        event.media_types.append(cached.media_type)
+        if len(event.media_urls) == 1:
+            if cached.kind == "image":
+                event.message_type = MessageType.PHOTO
+            elif cached.kind == "video":
+                event.message_type = MessageType.VIDEO
+        event.text = self._append_observed_note(
+            event.text,
+            f"[Replied-to {cached.kind} '{cached.display_name}' saved at: {cached.path}]",
+        )
+        logger.info("[Telegram] Cached replied-to %s at %s", cached.kind, cached.path)
+
     def _observed_media_source(self, msg: Message):
         """Return (telegram_file_source, filename, mime, default_kind) or Nones."""
         if msg.photo:
@@ -5703,6 +5788,7 @@ class TelegramAdapter(BasePlatformAdapter):
 
         event = self._build_message_event(msg, MessageType.TEXT, update_id=update.update_id)
         event.text = self._clean_bot_trigger_text(event.text)
+        await self._cache_replied_media(msg, event)
         event = self._apply_telegram_group_observe_attribution(event)
         self._enqueue_text_event(event)
 
@@ -5717,6 +5803,7 @@ class TelegramAdapter(BasePlatformAdapter):
 
         event = self._build_message_event(msg, MessageType.COMMAND, update_id=update.update_id)
         event.text = self._clean_bot_trigger_text(event.text)
+        await self._cache_replied_media(msg, event)
         event = self._apply_telegram_group_observe_attribution(event)
         await self.handle_message(event)
 
